@@ -2,20 +2,42 @@
 """
 json2md.py
 
-Convert arbitrary JSON into LLM/RAG-friendly Markdown.
+LLM/RAG-oriented JSON -> Markdown converter.
 
-Design goals:
-- Preserve source values exactly
-- Make JSON hierarchy explicit
-- Keep records independently retrievable
-- Preserve JSON paths for verification
-- Avoid Markdown tables
-- Avoid generated/interpretive descriptions
-- Handle arbitrary JSON structures
-- Produce deterministic output
-- Provide size/token estimates
-- Optionally include/exclude JSON paths
-- Sensibly identify records inside arrays
+Designed initially for RePoE / Path of Exile datasets, but can also
+process arbitrary JSON.
+
+Main goals:
+
+    JSON
+      ↓
+    remove empty/noise values
+      ↓
+    compress repetitive structures
+      ↓
+    preserve source values
+      ↓
+    create independent records
+      ↓
+    Markdown suitable for NotebookLM / Gemini
+
+The converter does NOT:
+    - invent descriptions
+    - summarize facts
+    - infer missing values
+    - modify numeric values
+    - translate game data
+    - resolve external references unless explicitly requested
+
+Usage:
+
+    python json2md.py data/mods.json
+
+    python json2md.py data/mods.json ai/mods.md
+
+    python json2md.py data/mods.json ai/mods.md --dataset mods
+
+    python json2md.py data/mods.json ai/mods.md --stats
 """
 
 from __future__ import annotations
@@ -24,39 +46,71 @@ import argparse
 import json
 import re
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Configuration
-# ---------------------------------------------------------------------------
+# ============================================================================
 
-DEFAULT_MAX_HEADING_DEPTH = 6
-
-# Fields commonly useful as human-readable record identifiers.
-IDENTIFIER_FIELDS = (
+# Fields that are almost always useful when represented in an LLM document.
+#
+# This is NOT an allow-list. Unknown fields are still preserved.
+# It only controls preferred ordering.
+PREFERRED_ORDER = [
     "name",
-    "title",
-    "id",
-    "slug",
-    "key",
-    "uuid",
-    "uid",
-)
+    "text",
+    "type",
+    "domain",
+    "generation_type",
+    "required_level",
+    "is_essence_only",
+    "stats",
+    "groups",
+    "spawn_weights",
+    "generation_weights",
+    "adds_tags",
+    "implicit_tags",
+    "grants_effects",
+    "gold_value",
+]
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# These fields are commonly empty and provide no information when empty.
+DROP_EMPTY = True
 
-def format_scalar(value: Any) -> str:
+
+# Values above this length are kept, but rendered as block text rather
+# than trying to put them into a single Markdown line.
+LONG_TEXT_THRESHOLD = 500
+
+
+# ============================================================================
+# Basic helpers
+# ============================================================================
+
+def is_empty(value: Any) -> bool:
+    """Return True if a value contains no useful data."""
+
+    if value is None:
+        return True
+
+    if value == "":
+        return True
+
+    if isinstance(value, list) and len(value) == 0:
+        return True
+
+    if isinstance(value, dict) and len(value) == 0:
+        return True
+
+    return False
+
+
+def scalar_to_text(value: Any) -> str:
     """
-    Convert a JSON scalar into Markdown-safe text.
-
-    Important:
-    We do not interpret or modify the actual value.
+    Convert a scalar without changing its meaning.
     """
 
     if value is None:
@@ -68,631 +122,951 @@ def format_scalar(value: Any) -> str:
     if value is False:
         return "false"
 
-    if isinstance(value, (int, float)):
-        return str(value)
-
     if isinstance(value, str):
         return value
 
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
+    return str(value)
 
 
-def safe_heading(value: str) -> str:
+def clean_text(value: str) -> str:
     """
-    Make a value safe to use as a Markdown heading without
-    changing the underlying source value.
+    Prevent source strings from accidentally becoming Markdown structure.
+
+    The actual value is not modified in the dataset logic.
     """
 
-    value = str(value).strip()
-
-    if not value:
-        return "(empty)"
-
-    # Prevent accidental Markdown heading injection.
-    value = re.sub(r"^#+\s*", "", value)
-
-    return value
+    return value.replace("\r\n", "\n").replace("\r", "\n")
 
 
-def scalar_preview(value: Any, max_length: int = 80) -> str:
+def safe_heading(value: Any) -> str:
     """
-    Create a short preview for record headings.
-
-    This is presentation-only; source values remain unchanged below.
+    Make a value safe to use in a Markdown heading.
     """
 
-    text = format_scalar(value)
-
+    text = scalar_to_text(value)
     text = text.replace("\n", " ")
 
-    if len(text) > max_length:
-        return text[:max_length - 3] + "..."
+    # Prevent source data beginning with # from creating another heading.
+    text = re.sub(r"^#+\s*", "", text)
 
-    return text
+    if len(text) > 160:
+        text = text[:157] + "..."
+
+    return text or "(unnamed)"
+
+
+def ordered_keys(obj: dict[str, Any]) -> list[str]:
+    """
+    Put important fields first while preserving all unknown fields.
+    """
+
+    preferred = [
+        key for key in PREFERRED_ORDER
+        if key in obj
+    ]
+
+    remaining = [
+        key for key in obj
+        if key not in preferred
+    ]
+
+    return preferred + remaining
 
 
 def find_identifier(obj: dict[str, Any]) -> tuple[str, Any] | None:
     """
-    Find a useful human-readable identifier for an object.
+    Find a useful identifier for arbitrary records.
     """
 
-    for field in IDENTIFIER_FIELDS:
+    for field in (
+        "name",
+        "title",
+        "id",
+        "slug",
+        "key",
+        "uuid",
+    ):
         if field in obj:
             value = obj[field]
 
             if not isinstance(value, (dict, list)):
-                return field, value
+                if not is_empty(value):
+                    return field, value
 
     return None
 
 
-def is_scalar(value: Any) -> bool:
-    return not isinstance(value, (dict, list))
+# ============================================================================
+# Compact RePoE structures
+# ============================================================================
 
-
-def is_array_of_objects(value: Any) -> bool:
-    return (
-        isinstance(value, list)
-        and len(value) > 0
-        and all(isinstance(item, dict) for item in value)
-    )
-
-
-def is_object_of_objects(value: Any) -> bool:
-    return (
-        isinstance(value, dict)
-        and len(value) > 0
-        and all(isinstance(item, dict) for item in value.values())
-    )
-
-
-def json_path_property(path: str, key: str) -> str:
+def render_stats(stats: list[Any]) -> list[str]:
     """
-    Build a readable JSON path.
+    Compress RePoE stats.
 
-    Uses dot notation for normal keys and bracket notation
-    for unusual keys.
+    Input:
+
+        [
+            {
+                "id": "maximum_life",
+                "min": 10,
+                "max": 20
+            }
+        ]
+
+    Output:
+
+        - maximum_life: 10-20
     """
 
-    if not path:
-        return key
+    lines = []
 
-    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key):
-        return f"{path}.{key}"
+    for stat in stats:
 
-    escaped = key.replace("\\", "\\\\").replace('"', '\\"')
-    return f'{path}["{escaped}"]'
+        if not isinstance(stat, dict):
+            lines.append(f"- {scalar_to_text(stat)}")
+            continue
 
+        stat_id = stat.get("id", "?")
+        minimum = stat.get("min")
+        maximum = stat.get("max")
 
-# ---------------------------------------------------------------------------
-# Renderer
-# ---------------------------------------------------------------------------
-
-class MarkdownRenderer:
-    def __init__(
-        self,
-        *,
-        include_paths: bool = True,
-        max_heading_depth: int = DEFAULT_MAX_HEADING_DEPTH,
-    ):
-        self.include_paths = include_paths
-        self.max_heading_depth = max_heading_depth
-
-    # -----------------------------------------------------------------------
-    # Public API
-    # -----------------------------------------------------------------------
-
-    def render(self, data: Any) -> str:
-        lines: list[str] = []
-
-        lines.extend(self.render_root(data))
-
-        return "\n".join(lines).rstrip() + "\n"
-
-    # -----------------------------------------------------------------------
-    # Root
-    # -----------------------------------------------------------------------
-
-    def render_root(self, data: Any) -> list[str]:
-        lines: list[str] = []
-
-        if isinstance(data, dict):
-            lines.extend(
-                self.render_object(
-                    data,
-                    path="$",
-                    heading_level=2,
-                    root=True,
+        if minimum is not None and maximum is not None:
+            if minimum == maximum:
+                lines.append(
+                    f"- `{stat_id}`: {minimum}"
                 )
+            else:
+                lines.append(
+                    f"- `{stat_id}`: {minimum}-{maximum}"
+                )
+
+        elif minimum is not None:
+            lines.append(
+                f"- `{stat_id}`: min={minimum}"
             )
 
-        elif isinstance(data, list):
+        elif maximum is not None:
+            lines.append(
+                f"- `{stat_id}`: max={maximum}"
+            )
+
+        else:
+            lines.append(
+                f"- `{stat_id}`"
+            )
+
+    return lines
+
+
+def render_weights(weights: list[Any]) -> str:
+    """
+    Compress RePoE weight arrays.
+
+    Input:
+
+        [
+            {"tag": "ring", "weight": 500},
+            {"tag": "amulet", "weight": 250}
+        ]
+
+    Output:
+
+        ring=500, amulet=250
+    """
+
+    parts = []
+
+    for entry in weights:
+
+        if not isinstance(entry, dict):
+            parts.append(scalar_to_text(entry))
+            continue
+
+        tag = entry.get("tag", "?")
+        weight = entry.get("weight", "?")
+
+        parts.append(
+            f"{tag}={weight}"
+        )
+
+    return ", ".join(parts)
+
+
+def render_granted_effects(effects: list[Any]) -> list[str]:
+    """
+    Compress granted effects.
+    """
+
+    lines = []
+
+    for effect in effects:
+
+        if not isinstance(effect, dict):
+            lines.append(
+                f"- {scalar_to_text(effect)}"
+            )
+            continue
+
+        effect_id = effect.get(
+            "granted_effect_id",
+            "?",
+        )
+
+        level = effect.get("level")
+
+        if level is not None:
+            lines.append(
+                f"- `{effect_id}` (level {level})"
+            )
+        else:
+            lines.append(
+                f"- `{effect_id}`"
+            )
+
+    return lines
+
+
+# ============================================================================
+# Generic arrays
+# ============================================================================
+
+def render_scalar_array(
+    values: list[Any],
+) -> list[str]:
+
+    return [
+        f"- {scalar_to_text(value)}"
+        for value in values
+        if not (DROP_EMPTY and is_empty(value))
+    ]
+
+
+def render_generic_array(
+    values: list[Any],
+    indent: str = "",
+) -> list[str]:
+
+    lines = []
+
+    for value in values:
+
+        if is_empty(value) and DROP_EMPTY:
+            continue
+
+        if isinstance(value, dict):
+
+            identifier = find_identifier(value)
+
+            if identifier:
+                field, identifier_value = identifier
+
+                lines.append(
+                    f"{indent}- **{field}:** "
+                    f"{safe_heading(identifier_value)}"
+                )
+            else:
+                lines.append(
+                    f"{indent}-"
+                )
+
+            nested = render_generic_object(
+                value,
+                indent=indent + "  ",
+            )
+
+            lines.extend(nested)
+
+        elif isinstance(value, list):
+
+            lines.append(
+                f"{indent}-"
+            )
+
             lines.extend(
-                self.render_array(
-                    data,
-                    path="$",
-                    heading_level=2,
-                    root=True,
+                render_generic_array(
+                    value,
+                    indent=indent + "  ",
                 )
             )
 
         else:
-            lines.append("## Value")
-            lines.append("")
-            lines.append(f"**JSON Path:** `$`")
-            lines.append("")
-            lines.append(format_scalar(data))
-            lines.append("")
 
-        return lines
-
-    # -----------------------------------------------------------------------
-    # Objects
-    # -----------------------------------------------------------------------
-
-    def render_object(
-        self,
-        obj: dict[str, Any],
-        *,
-        path: str,
-        heading_level: int,
-        root: bool = False,
-    ) -> list[str]:
-
-        lines: list[str] = []
-
-        # Scalars first.
-        #
-        # This is intentional:
-        # Important identifying fields become immediately visible
-        # when an LLM retrieves a chunk.
-        scalar_fields = [
-            (key, value)
-            for key, value in obj.items()
-            if is_scalar(value)
-        ]
-
-        complex_fields = [
-            (key, value)
-            for key, value in obj.items()
-            if not is_scalar(value)
-        ]
-
-        for key, value in scalar_fields:
             lines.append(
-                f"- **{key}:** {format_scalar(value)}"
+                f"{indent}- "
+                f"{scalar_to_text(value)}"
             )
 
-        if scalar_fields and complex_fields:
-            lines.append("")
+    return lines
 
-        # Nested values.
-        for key, value in complex_fields:
-            child_path = json_path_property(path, key)
 
-            lines.extend(
-                self.render_field(
-                    key,
-                    value,
-                    path=child_path,
-                    heading_level=heading_level,
-                )
+# ============================================================================
+# Generic object renderer
+# ============================================================================
+
+def render_generic_object(
+    obj: dict[str, Any],
+    *,
+    indent: str = "",
+) -> list[str]:
+
+    lines = []
+
+    for key in ordered_keys(obj):
+
+        value = obj[key]
+
+        if DROP_EMPTY and is_empty(value):
+            continue
+
+        if isinstance(value, (str, int, float, bool)) or value is None:
+
+            text = clean_text(
+                scalar_to_text(value)
             )
 
-        return lines
-
-    # -----------------------------------------------------------------------
-    # Fields
-    # -----------------------------------------------------------------------
-
-    def render_field(
-        self,
-        key: str,
-        value: Any,
-        *,
-        path: str,
-        heading_level: int,
-    ) -> list[str]:
-
-        lines: list[str] = []
-
-        level = min(
-            heading_level + 1,
-            self.max_heading_depth,
-        )
-
-        heading = "#" * level
-
-        if isinstance(value, dict):
-            lines.append(f"{heading} {safe_heading(key)}")
-            lines.append("")
-
-            if self.include_paths:
-                lines.append(f"**JSON Path:** `{path}`")
-                lines.append("")
-
-            lines.extend(
-                self.render_object(
-                    value,
-                    path=path,
-                    heading_level=level,
-                )
-            )
-
-            lines.append("")
-
-        elif isinstance(value, list):
-            lines.append(f"{heading} {safe_heading(key)}")
-            lines.append("")
-
-            if self.include_paths:
-                lines.append(f"**JSON Path:** `{path}`")
-                lines.append("")
-
-            lines.extend(
-                self.render_array(
-                    value,
-                    path=path,
-                    heading_level=level,
-                )
-            )
-
-            lines.append("")
-
-        return lines
-
-    # -----------------------------------------------------------------------
-    # Arrays
-    # -----------------------------------------------------------------------
-
-    def render_array(
-        self,
-        array: list[Any],
-        *,
-        path: str,
-        heading_level: int,
-        root: bool = False,
-    ) -> list[str]:
-
-        lines: list[str] = []
-
-        if not array:
-            lines.append("_Empty array._")
-            return lines
-
-        # Array of objects:
-        #
-        # Treat every object as an independent record.
-        #
-        # This is particularly important for RAG because it creates
-        # natural retrieval boundaries.
-        if is_array_of_objects(array):
-
-            for index, item in enumerate(array):
-                item_path = f"{path}[{index}]"
-
-                identifier = find_identifier(item)
-
-                if identifier:
-                    field, value = identifier
-                    title = (
-                        f"{field}: "
-                        f"{scalar_preview(value)}"
-                    )
-                else:
-                    title = f"Record {index + 1}"
-
-                level = min(
-                    heading_level + 1,
-                    self.max_heading_depth,
-                )
+            if "\n" in text or len(text) > LONG_TEXT_THRESHOLD:
 
                 lines.append(
-                    f"{'#' * level} {safe_heading(title)}"
+                    f"{indent}**{key}:**"
                 )
                 lines.append("")
-
-                if self.include_paths:
-                    lines.append(
-                        f"**JSON Path:** `{item_path}`"
-                    )
-                    lines.append("")
 
                 lines.extend(
-                    self.render_object(
-                        item,
-                        path=item_path,
-                        heading_level=level,
-                    )
+                    f"{indent}{line}"
+                    for line in text.splitlines()
                 )
 
                 lines.append("")
-
-            return lines
-
-        # Array containing nested arrays/objects/scalars.
-        for index, item in enumerate(array):
-            item_path = f"{path}[{index}]"
-
-            if isinstance(item, dict):
-
-                level = min(
-                    heading_level + 1,
-                    self.max_heading_depth,
-                )
-
-                identifier = find_identifier(item)
-
-                if identifier:
-                    field, value = identifier
-                    title = (
-                        f"{field}: "
-                        f"{scalar_preview(value)}"
-                    )
-                else:
-                    title = f"Item {index + 1}"
-
-                lines.append(
-                    f"{'#' * level} {safe_heading(title)}"
-                )
-                lines.append("")
-
-                if self.include_paths:
-                    lines.append(
-                        f"**JSON Path:** `{item_path}`"
-                    )
-                    lines.append("")
-
-                lines.extend(
-                    self.render_object(
-                        item,
-                        path=item_path,
-                        heading_level=level,
-                    )
-                )
-
-                lines.append("")
-
-            elif isinstance(item, list):
-
-                lines.append(
-                    f"- **Item {index + 1}**"
-                )
-
-                if self.include_paths:
-                    lines.append(
-                        f"  - JSON Path: `{item_path}`"
-                    )
-
-                lines.extend(
-                    self.render_array(
-                        item,
-                        path=item_path,
-                        heading_level=heading_level,
-                    )
-                )
 
             else:
 
-                if self.include_paths:
-                    lines.append(
-                        f"- **Item {index + 1}** "
-                        f"(`{item_path}`): "
-                        f"{format_scalar(item)}"
+                lines.append(
+                    f"{indent}**{key}:** {text}"
+                )
+
+        elif isinstance(value, list):
+
+            if not value:
+                continue
+
+            lines.append(
+                f"{indent}**{key}:**"
+            )
+
+            lines.extend(
+                render_generic_array(
+                    value,
+                    indent=indent + "  ",
+                )
+            )
+
+        elif isinstance(value, dict):
+
+            lines.append(
+                f"{indent}**{key}:**"
+            )
+
+            lines.extend(
+                render_generic_object(
+                    value,
+                    indent=indent + "  ",
+                )
+            )
+
+    return lines
+
+
+# ============================================================================
+# RePoE mod renderer
+# ============================================================================
+
+def render_mod(
+    mod_id: str,
+    mod: dict[str, Any],
+) -> list[str]:
+
+    lines = []
+
+    name = mod.get("name")
+
+    if name and not is_empty(name):
+        title = name
+    else:
+        title = mod_id
+
+    lines.append(
+        f"## Mod: {safe_heading(title)}"
+    )
+
+    lines.append("")
+
+    # The ID is extremely useful for cross-referencing with other RePoE
+    # datasets, so it is always retained.
+    lines.append(
+        f"**ID:** `{mod_id}`"
+    )
+
+    lines.append("")
+
+    # ------------------------------------------------------------------------
+    # Important scalar properties
+    # ------------------------------------------------------------------------
+
+    scalar_fields = [
+        "text",
+        "type",
+        "domain",
+        "generation_type",
+        "required_level",
+        "is_essence_only",
+        "gold_value",
+    ]
+
+    for field in scalar_fields:
+
+        if field not in mod:
+            continue
+
+        value = mod[field]
+
+        if DROP_EMPTY and is_empty(value):
+            continue
+
+        if field == "text":
+
+            text = clean_text(
+                scalar_to_text(value)
+            )
+
+            if len(text) > LONG_TEXT_THRESHOLD or "\n" in text:
+
+                lines.append("**Text:**")
+                lines.append("")
+                lines.append(text)
+                lines.append("")
+
+            else:
+
+                lines.append(
+                    f"**Text:** {text}"
+                )
+
+        else:
+
+            lines.append(
+                f"**{field}:** "
+                f"{scalar_to_text(value)}"
+            )
+
+    # ------------------------------------------------------------------------
+    # Stats
+    # ------------------------------------------------------------------------
+
+    stats = mod.get("stats")
+
+    if stats:
+        lines.append("")
+        lines.append("### Stats")
+        lines.append("")
+        lines.extend(render_stats(stats))
+
+    # ------------------------------------------------------------------------
+    # Groups
+    # ------------------------------------------------------------------------
+
+    groups = mod.get("groups")
+
+    if groups:
+        lines.append("")
+        lines.append("### Groups")
+        lines.append("")
+
+        lines.append(
+            ", ".join(
+                f"`{scalar_to_text(x)}`"
+                for x in groups
+                if not is_empty(x)
+            )
+        )
+
+    # ------------------------------------------------------------------------
+    # Spawn weights
+    # ------------------------------------------------------------------------
+
+    spawn_weights = mod.get("spawn_weights")
+
+    if spawn_weights:
+        lines.append("")
+        lines.append("### Spawn Weights")
+        lines.append("")
+        lines.append(
+            render_weights(spawn_weights)
+        )
+
+    # ------------------------------------------------------------------------
+    # Generation weights
+    # ------------------------------------------------------------------------
+
+    generation_weights = mod.get(
+        "generation_weights"
+    )
+
+    if generation_weights:
+        lines.append("")
+        lines.append("### Generation Weights")
+        lines.append("")
+        lines.append(
+            render_weights(
+                generation_weights
+            )
+        )
+
+    # ------------------------------------------------------------------------
+    # Tags
+    # ------------------------------------------------------------------------
+
+    adds_tags = mod.get("adds_tags")
+
+    if adds_tags:
+        lines.append("")
+        lines.append("### Adds Tags")
+        lines.append("")
+        lines.append(
+            ", ".join(
+                f"`{scalar_to_text(x)}`"
+                for x in adds_tags
+                if not is_empty(x)
+            )
+        )
+
+    implicit_tags = mod.get("implicit_tags")
+
+    if implicit_tags:
+        lines.append("")
+        lines.append("### Implicit Tags")
+        lines.append("")
+        lines.append(
+            ", ".join(
+                f"`{scalar_to_text(x)}`"
+                for x in implicit_tags
+                if not is_empty(x)
+            )
+        )
+
+    # ------------------------------------------------------------------------
+    # Granted effects
+    # ------------------------------------------------------------------------
+
+    grants_effects = mod.get(
+        "grants_effects"
+    )
+
+    if grants_effects:
+        lines.append("")
+        lines.append("### Granted Effects")
+        lines.append("")
+        lines.extend(
+            render_granted_effects(
+                grants_effects
+            )
+        )
+
+    # ------------------------------------------------------------------------
+    # Unknown fields
+    #
+    # This protects us if RePoE adds something in a future version.
+    # ------------------------------------------------------------------------
+
+    known_fields = {
+        "name",
+        "text",
+        "type",
+        "domain",
+        "generation_type",
+        "required_level",
+        "is_essence_only",
+        "gold_value",
+        "stats",
+        "groups",
+        "spawn_weights",
+        "generation_weights",
+        "adds_tags",
+        "implicit_tags",
+        "grants_effects",
+    }
+
+    unknown_fields = [
+        key
+        for key in mod
+        if key not in known_fields
+    ]
+
+    for key in unknown_fields:
+
+        value = mod[key]
+
+        if DROP_EMPTY and is_empty(value):
+            continue
+
+        lines.append("")
+        lines.append(
+            f"### {safe_heading(key)}"
+        )
+        lines.append("")
+
+        lines.extend(
+            render_generic_object(
+                {key: value}
+            )
+        )
+
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+
+    return lines
+
+
+# ============================================================================
+# Dataset detection
+# ============================================================================
+
+def detect_dataset(
+    data: Any,
+    filename: str,
+) -> str:
+
+    name = filename.lower()
+
+    if name in {
+        "mods.json",
+        "mods.min.json",
+    }:
+        return "mods"
+
+    if name in {
+        "stats.json",
+        "stats.min.json",
+    }:
+        return "stats"
+
+    if name in {
+        "stat_translations.json",
+        "stat_translations.min.json",
+    }:
+        return "stat_translations"
+
+    # Heuristic detection.
+    if isinstance(data, dict):
+
+        sample = next(
+            iter(data.values()),
+            None,
+        )
+
+        if isinstance(sample, dict):
+
+            if (
+                "generation_type" in sample
+                and "stats" in sample
+            ):
+                return "mods"
+
+    return "generic"
+
+
+# ============================================================================
+# Generic dataset renderer
+# ============================================================================
+
+def render_generic_dataset(
+    data: Any,
+) -> list[str]:
+
+    lines = []
+
+    if isinstance(data, dict):
+
+        for key, value in data.items():
+
+            if DROP_EMPTY and is_empty(value):
+                continue
+
+            if isinstance(value, dict):
+
+                identifier = find_identifier(
+                    value
+                )
+
+                if identifier:
+
+                    field, identifier_value = (
+                        identifier
+                    )
+
+                    title = (
+                        f"{field}: "
+                        f"{safe_heading(identifier_value)}"
+                    )
+
+                else:
+
+                    title = safe_heading(key)
+
+                lines.append(
+                    f"## {title}"
+                )
+
+                lines.append("")
+
+                lines.append(
+                    f"**ID:** `{key}`"
+                )
+
+                lines.append("")
+
+                lines.extend(
+                    render_generic_object(
+                        value
+                    )
+                )
+
+                lines.append("")
+                lines.append("---")
+                lines.append("")
+
+            else:
+
+                lines.append(
+                    f"## {safe_heading(key)}"
+                )
+
+                lines.append("")
+
+                if isinstance(value, list):
+                    lines.extend(
+                        render_generic_array(value)
                     )
                 else:
                     lines.append(
-                        f"- {format_scalar(item)}"
+                        scalar_to_text(value)
                     )
 
-        return lines
+                lines.append("")
+
+    elif isinstance(data, list):
+
+        for index, value in enumerate(data):
+
+            if DROP_EMPTY and is_empty(value):
+                continue
+
+            lines.append(
+                f"## Record {index + 1}"
+            )
+
+            lines.append("")
+
+            if isinstance(value, dict):
+                lines.extend(
+                    render_generic_object(value)
+                )
+            else:
+                lines.append(
+                    scalar_to_text(value)
+                )
+
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+
+    else:
+
+        lines.append(
+            scalar_to_text(data)
+        )
+
+    return lines
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Statistics
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 def count_nodes(value: Any) -> int:
-    """
-    Count every JSON value recursively.
-    """
 
     if isinstance(value, dict):
         return (
             1
-            + sum(count_nodes(v) for v in value.values())
+            + sum(
+                count_nodes(v)
+                for v in value.values()
+            )
         )
 
     if isinstance(value, list):
         return (
             1
-            + sum(count_nodes(v) for v in value)
+            + sum(
+                count_nodes(v)
+                for v in value
+            )
         )
 
     return 1
 
 
 def count_records(value: Any) -> int:
-    """
-    Approximate number of meaningful records.
 
-    Primarily counts objects inside arrays.
-    """
+    if isinstance(value, dict):
 
-    count = 0
+        return sum(
+            1 if isinstance(v, dict) else 0
+            for v in value.values()
+        )
 
     if isinstance(value, list):
-        for item in value:
-            if isinstance(item, dict):
-                count += 1
 
-            count += count_records(item)
+        return sum(
+            1 if isinstance(v, dict) else 0
+            for v in value
+        )
 
-    elif isinstance(value, dict):
-        for child in value.values():
-            count += count_records(child)
-
-    return count
+    return 0
 
 
 def estimate_tokens(text: str) -> int:
     """
-    Rough token estimate.
+    Rough estimate only.
 
-    This is intentionally conservative and is NOT tokenizer-specific.
+    Actual Gemini tokenization will differ.
     """
 
-    # ~4 characters/token is a useful rough estimate for English text.
-    return max(1, (len(text) + 3) // 4)
+    return max(
+        1,
+        (len(text) + 3) // 4,
+    )
 
 
-def collect_stats(
-    data: Any,
-    markdown: str,
-) -> dict[str, Any]:
-
-    if isinstance(data, dict):
-        root_type = "object"
-        root_entries = len(data)
-
-    elif isinstance(data, list):
-        root_type = "array"
-        root_entries = len(data)
-
-    else:
-        root_type = type(data).__name__
-        root_entries = 1
-
-    return {
-        "root_type": root_type,
-        "root_entries": root_entries,
-        "json_nodes": count_nodes(data),
-        "records": count_records(data),
-        "markdown_characters": len(markdown),
-        "markdown_words": len(markdown.split()),
-        "estimated_tokens": estimate_tokens(markdown),
-        "markdown_bytes": len(markdown.encode("utf-8")),
-    }
-
-
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Header
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 def build_header(
     *,
-    source_file: Path,
+    dataset_name: str,
+    source: Path,
     data: Any,
-    markdown: str,
-    include_paths: bool,
+    body: str,
 ) -> str:
 
-    stats = collect_stats(data, markdown)
+    records = count_records(data)
+    nodes = count_nodes(data)
 
-    generated = datetime.now(timezone.utc).isoformat(
-        timespec="seconds"
+    size_bytes = len(
+        body.encode("utf-8")
     )
 
-    lines = [
-        f"# Dataset: {source_file.stem}",
-        "",
-        "> This document is a deterministic conversion of a JSON dataset "
-        "into structured Markdown for LLM/RAG consumption.",
-        ">",
-        "> Source values are preserved. The converter does not infer, "
-        "summarize, classify, or generate factual content.",
-        "",
-        "## Document Metadata",
-        "",
-        f"- **Source file:** `{source_file.name}`",
-        f"- **Generated:** `{generated}`",
-        f"- **Root type:** `{stats['root_type']}`",
-        f"- **Top-level entries:** `{stats['root_entries']}`",
-        f"- **JSON nodes:** `{stats['json_nodes']:,}`",
-        f"- **Records:** `{stats['records']:,}`",
-        f"- **Markdown characters:** `{stats['markdown_characters']:,}`",
-        f"- **Markdown words:** `{stats['markdown_words']:,}`",
-        f"- **Estimated tokens:** `{stats['estimated_tokens']:,}`",
-        f"- **Markdown size:** "
-        f"`{stats['markdown_bytes'] / 1024 / 1024:.2f} MiB`",
-        "",
-        "## Reading Rules",
-        "",
-        "- Treat the source data as authoritative for this dataset.",
-        "- Do not assume a field exists if it is not present.",
-        "- Do not infer missing values.",
-        "- `null` means the source JSON explicitly contained a null value.",
-        "- Empty arrays and objects are preserved as empty.",
-        "- JSON Paths identify the original location of a value.",
-        "- Headings and labels are structural metadata added by this converter.",
-        "",
-    ]
+    tokens = estimate_tokens(body)
 
-    if include_paths:
-        lines.extend([
-            "## JSON Path Convention",
-            "",
-            "- `$` = JSON document root",
-            "- `.field` = object property",
-            "- `[N]` = array index",
-            '- `["field"]` = object property containing special characters',
-            "",
-        ])
+    return f"""# Path of Exile Data: {dataset_name}
 
-    lines.extend([
-        "---",
-        "",
-        "## Dataset",
-        "",
-    ])
+> Source: `{source.name}`
+>
+> This document is a deterministic conversion of the source JSON.
+> No factual information has been inferred or generated.
+>
+> Values shown here originate from the source dataset.
+> Missing fields should not be assumed to exist.
+> Empty values are omitted to reduce noise.
+>
+> Internal IDs are preserved because they may reference other RePoE datasets.
 
-    return "\n".join(lines)
+## Dataset Information
+
+- Records: {records:,}
+- JSON nodes: {nodes:,}
+- Markdown characters: {len(body):,}
+- Estimated tokens: {tokens:,}
+- Markdown size: {size_bytes / 1024 / 1024:.2f} MiB
+
+---
+
+"""
 
 
-# ---------------------------------------------------------------------------
-# Main conversion
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Conversion
+# ============================================================================
 
 def convert(
     input_path: Path,
     output_path: Path,
     *,
-    include_paths: bool,
-    max_heading_depth: int,
+    dataset: str | None = None,
 ) -> dict[str, Any]:
 
-    try:
-        with input_path.open(
-            "r",
-            encoding="utf-8",
-        ) as f:
-            data = json.load(f)
+    with input_path.open(
+        "r",
+        encoding="utf-8",
+    ) as f:
 
-    except json.JSONDecodeError as exc:
-        raise ValueError(
-            f"Invalid JSON in {input_path}: "
-            f"{exc.msg} at line {exc.lineno}, column {exc.colno}"
-        ) from exc
+        data = json.load(f)
 
-    renderer = MarkdownRenderer(
-        include_paths=include_paths,
-        max_heading_depth=max_heading_depth,
+    dataset_name = (
+        dataset
+        or detect_dataset(
+            data,
+            input_path.name,
+        )
     )
 
-    body = renderer.render(data)
+    # ---------------------------------------------------------------
+    # Render
+    # ---------------------------------------------------------------
+
+    if dataset_name == "mods":
+
+        if not isinstance(data, dict):
+            raise ValueError(
+                "mods dataset must be a JSON object"
+            )
+
+        body_lines = []
+
+        for mod_id, mod in data.items():
+
+            if not isinstance(mod, dict):
+                continue
+
+            body_lines.extend(
+                render_mod(
+                    mod_id,
+                    mod,
+                )
+            )
+
+        body = "\n".join(
+            body_lines
+        )
+
+    else:
+
+        body = "\n".join(
+            render_generic_dataset(
+                data
+            )
+        )
 
     header = build_header(
-        source_file=input_path,
+        dataset_name=dataset_name,
+        source=input_path,
         data=data,
-        markdown=body,
-        include_paths=include_paths,
+        body=body,
     )
 
-    markdown = header + body
+    output = header + body
 
     output_path.parent.mkdir(
         parents=True,
@@ -700,25 +1074,33 @@ def convert(
     )
 
     output_path.write_text(
-        markdown,
+        output,
         encoding="utf-8",
     )
 
-    stats = collect_stats(data, markdown)
+    return {
+        "dataset": dataset_name,
+        "records": count_records(data),
+        "nodes": count_nodes(data),
+        "characters": len(output),
+        "words": len(output.split()),
+        "estimated_tokens": estimate_tokens(output),
+        "bytes": len(
+            output.encode("utf-8")
+        ),
+    }
 
-    return stats
 
-
-# ---------------------------------------------------------------------------
+# ============================================================================
 # CLI
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 def main() -> int:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Convert JSON into structured Markdown optimized "
-            "for LLM/RAG consumption."
+            "Convert RePoE/JSON datasets into "
+            "compact LLM/RAG-friendly Markdown."
         )
     )
 
@@ -734,24 +1116,28 @@ def main() -> int:
         nargs="?",
         help=(
             "Output Markdown file. "
-            "Defaults to input filename with .md extension."
+            "Defaults to <input>.md"
         ),
     )
 
     parser.add_argument(
-        "--no-paths",
-        action="store_true",
-        help="Do not include JSON Paths in the Markdown.",
-    )
-
-    parser.add_argument(
-        "--max-heading-depth",
-        type=int,
-        default=DEFAULT_MAX_HEADING_DEPTH,
+        "--dataset",
+        choices=[
+            "mods",
+            "stats",
+            "stat_translations",
+            "generic",
+        ],
         help=(
-            "Maximum Markdown heading depth "
-            f"(default: {DEFAULT_MAX_HEADING_DEPTH})."
+            "Force dataset type. "
+            "Normally detected automatically."
         ),
+    )
+
+    parser.add_argument(
+        "--stats",
+        action="store_true",
+        help="Print output statistics.",
     )
 
     args = parser.parse_args()
@@ -765,35 +1151,29 @@ def main() -> int:
         )
         return 1
 
-    if not input_path.is_file():
-        print(
-            f"ERROR: Not a file: {input_path}",
-            file=sys.stderr,
-        )
-        return 1
-
-    if args.max_heading_depth < 2:
-        print(
-            "ERROR: --max-heading-depth must be >= 2",
-            file=sys.stderr,
-        )
-        return 1
-
     output_path = (
         args.output
-        if args.output
-        else input_path.with_suffix(".md")
+        or input_path.with_suffix(".md")
     )
 
     try:
-        stats = convert(
+
+        result = convert(
             input_path,
             output_path,
-            include_paths=not args.no_paths,
-            max_heading_depth=args.max_heading_depth,
+            dataset=args.dataset,
         )
 
-    except (OSError, ValueError) as exc:
+    except json.JSONDecodeError as exc:
+
+        print(
+            f"ERROR: Invalid JSON: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    except Exception as exc:
+
         print(
             f"ERROR: {exc}",
             file=sys.stderr,
@@ -801,20 +1181,22 @@ def main() -> int:
         return 1
 
     print()
-    print("JSON → Markdown complete")
-    print("------------------------")
-    print(f"Input       : {input_path}")
-    print(f"Output      : {output_path}")
-    print(f"Root type   : {stats['root_type']}")
-    print(f"Root entries: {stats['root_entries']:,}")
-    print(f"JSON nodes  : {stats['json_nodes']:,}")
-    print(f"Records     : {stats['records']:,}")
-    print(f"Characters  : {stats['markdown_characters']:,}")
-    print(f"Words       : {stats['markdown_words']:,}")
-    print(f"Est. tokens : {stats['estimated_tokens']:,}")
+    print("JSON → LLM Markdown")
+    print("===================")
+    print(f"Dataset       : {result['dataset']}")
+    print(f"Input         : {input_path}")
+    print(f"Output        : {output_path}")
+    print(f"Records       : {result['records']:,}")
+    print(f"JSON nodes    : {result['nodes']:,}")
+    print(f"Characters    : {result['characters']:,}")
+    print(f"Words         : {result['words']:,}")
     print(
-        f"Size        : "
-        f"{stats['markdown_bytes'] / 1024 / 1024:.2f} MiB"
+        f"Est. tokens   : "
+        f"{result['estimated_tokens']:,}"
+    )
+    print(
+        f"Size          : "
+        f"{result['bytes'] / 1024 / 1024:.2f} MiB"
     )
     print()
 
@@ -823,4 +1205,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
